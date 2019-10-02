@@ -1,0 +1,199 @@
+Description: >
+    Vijesh Puttaswamy / Udacity Project 2 - Delpoy High Availability Web App using CloudFormation
+    Server Configuration
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+
+    InstanceType:
+        Description: 
+            "The EC2 instance type"
+        Type: String
+        AllowedValues: [t3.nano, t3.micro, t3.small, t3.medium, t3.large, t3.xlarge, t3.2xlarge]
+
+Resources:
+
+    s3RootRole:
+        Type: AWS::IAM::Role
+        Properties:
+            RoleName: 
+                !Sub ${EnvironmentName}-Role
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                -   Effect: Allow
+                    Principal:
+                        Service:
+                        - ec2.amazonaws.com
+                    Action:
+                    - sts:AssumeRole
+            Path: "/"
+
+    s3RolePolicies:
+        Type: AWS::IAM::Policy
+        Properties:
+            PolicyName: Amazons3ReadOnlyAccess
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - 
+                    Effect: Allow
+                    Action: 
+                    -   s3:Get*
+                    -   s3:List*
+                    Resource: 
+                    -   arn:aws:s3:::hawebapp
+                    -   arn:aws:s3:::hawebapp/*
+            Roles:
+            -   Ref: s3RootRole
+
+    RootInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+            - Ref: s3RootRole
+
+    LoadBalancerSecGroup:
+            Type: AWS::EC2::SecurityGroup
+            Properties:
+                GroupDescription: loadbalancer security group that allows http traffic
+                VpcId:
+                    Fn::ImportValue:
+                        !Sub "${EnvironmentName}-VPCID"
+                SecurityGroupIngress:
+                -   IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    CidrIp: 0.0.0.0/0
+                SecurityGroupEgress:
+                -   IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    CidrIp: 0.0.0.0/0
+
+    WebServerSecGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: web server security group
+            VpcId: 
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+            -   IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+            -   IpProtocol: tcp
+                FromPort: 0
+                ToPort: 65535
+                CidrIp: 0.0.0.0/0
+
+    WebAppLaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    # Install Docker
+                    apt-get update -y
+                    apt-get install -y \
+                    apt-transport-https \
+                    ca-certificates \
+                    curl \
+                    gnupg-agent \
+                    software-properties-common \
+                    awscli
+                    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+                    add-apt-repository \
+                    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+                    $(lsb_release -cs) \
+                    stable"
+                    apt-get update -y
+                    # Install the latest version of Docker CE and containerd
+                    apt-get install -y docker-ce docker-ce-cli containerd.io
+                    # Add the user 'docker' to the 'ubuntu' group
+                    usermod -aG docker ubuntu
+                    mkdir /app/
+                    chmod 777 -R /app/
+                    aws s3 cp s3://hawebapp /app/ --recursive
+                    docker run -l service=nginx --name nginx-app -p 80:80 -d -v /app/:/usr/share/nginx/html nginx
+            ImageId: ami-06f2f779464715dc5
+            IamInstanceProfile: !Ref RootInstanceProfile
+            SecurityGroups:
+            -   Ref: WebServerSecGroup
+            InstanceType: !Ref 'InstanceType'
+            BlockDeviceMappings:
+            -   DeviceName: "/dev/sdk"
+                Ebs:
+                    VolumeSize: '10' 
+
+    WebAppGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier:
+            -   Fn::ImportValue:
+                    !Sub "${EnvironmentName}-PRIV-NETS"
+            LaunchConfigurationName:
+                Ref: WebAppLaunchConfig
+            MinSize: '2'
+            MaxSize: '4'
+            TargetGroupARNs:
+            -   Ref: WebAppTargetGroup
+
+    WebAppLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            SecurityGroups:
+            -   Ref: LoadBalancerSecGroup
+            Subnets:
+            -   Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+            -   Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+
+    WebAppTargetGroup:
+            Type: AWS::ElasticLoadBalancingV2::TargetGroup
+            Properties:
+                HealthCheckIntervalSeconds: 10
+                HealthCheckPath: /
+                HealthCheckProtocol: HTTP
+                HealthCheckTimeoutSeconds: 8
+                HealthyThresholdCount: 2
+                Port: 80
+                Protocol: HTTP
+                UnhealthyThresholdCount: 5
+                VpcId:
+                    Fn::ImportValue:
+                        Fn::Sub: "${EnvironmentName}-VPCID"
+    Listener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+            -   Type: forward
+                TargetGroupArn:
+                    Ref: WebAppTargetGroup
+            LoadBalancerArn:
+                Ref: WebAppLB
+            Port: '80'
+            Protocol: HTTP
+
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+            -   Type: forward
+                TargetGroupArn: !Ref 'WebAppTargetGroup'
+            Conditions:
+            -   Field: path-pattern
+                Values: [/]
+            ListenerArn: !Ref 'Listener'
+            Priority: 1
+
+Outputs:
+    WebAppLoadBalancerDNSName:
+        Description: DNS name of the Load Balancer
+        Value: !Join [ "", [ 'http://', !GetAtt WebAppLB.DNSName ]]
+        Export:
+            Name: !Sub ${EnvironmentName}-LB-DNS-Name
